@@ -66,3 +66,5 @@ popd
 
 # other deps
 sudo apt-get install binutils   # for addr2line
+sudo apt-get install libnuma-dev # for numaif.h
+sudo apt-get install librdmacm-dev # for rdma/rdma_cma.h and infiniband/verbs.h 

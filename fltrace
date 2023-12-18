@@ -124,7 +124,7 @@ if [[ $COMMAND == "record" ]]; then
         FLTRACE_NHANDLERS=${NHANDLERS} \
         FLTRACE_MAX_SAMPLES_PER_SEC=${SAMPLES_PER_SEC} \
         $@
-    echo "Run complete. Use 'fltrace report' to merge fault samples."
+    echo "Run complete. Use 'fltrace report' to merge fault samples, stored in `pwd`"
 fi
 
 # report

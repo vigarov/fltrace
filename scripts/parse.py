@@ -7,6 +7,14 @@ import sys
 import subprocess
 import pandas as pd
 import re
+from dataclasses import dataclass,field
+
+from bisect import bisect_left
+
+def binary_search(a, x, key,lo=0, hi=None):
+    if hi is None: hi = len(a)
+    pos = bisect_left(a, x, lo, hi, key=key)         # find insertion position
+    return pos if pos != hi and key(a[pos]) == x else -1  # don't walk off the end
 
 TIMECOL = "tstamp"
 
@@ -31,6 +39,7 @@ class Record:
     inode: int
     path: str
 
+    @staticmethod
     def parse(filename):
         records = []
         with open(filename) as fd:
@@ -49,9 +58,10 @@ class Record:
                 records.append(r)
         return records
 
+    @staticmethod
     def find_record(records, addr):
         for r in records:
-            if addr >= r.addr_start and addr < r.addr_end:
+            if r.addr_start <= addr < r.addr_end:
                 return r
         return None
 
@@ -71,6 +81,7 @@ class LibOrExe:
         self.base_addr = min([r.addr_start for r in records])
         self.ips = []
         self.codemap = {}
+        self.objdump = None
 
     def code_location(self, ipx):
         """Lookup the library to find code location for an ip"""
@@ -133,6 +144,109 @@ class FaultType(Enum):
     def __str__(self):
         return self.value
 
+@dataclass
+class ObjDump_ASM_Instr:
+    addr: int
+    hex_repr:str # space separate
+    instr:str
+    params:str
+
+    def get_full_text_repr(self):
+        return self.instr+' '+self.params
+
+    def __str__(self):
+        return self.get_full_text_repr()
+
+@dataclass
+class ObjDump_Section:
+    name:str
+    start_addr:int  #included
+    end_addr:int = -1 # excluded
+    asm_instructions : list[ObjDump_ASM_Instr] = field(default_factory=list)
+
+@dataclass
+class ObjDump:
+    sections : list[ObjDump_Section] = field(default_factory=list) #sorted by section start address
+
+def get_objdump_object(binary_file):
+    objdump_out = subprocess.run(['objdump', '-d', binary_file], stdout=subprocess.PIPE).stdout.decode("utf-8")
+    objdump = ObjDump()
+    current_section = None
+    change_of_data_section = False
+    for line in objdump_out.split("\n")[3:]:
+        if line is None:
+            continue
+        elif line.startswith("Disassembly of section"):
+            change_of_data_section = True
+        elif line.strip() != '':
+            if line[0].isnumeric():
+                #We're starting a new section
+                assert ':' in line
+                splitted = line.split()
+                assert len(splitted) == 2
+                raw_start, raw_name = splitted[0],splitted[1]
+                assert raw_start.isalnum() and '<' in raw_name and '>' in raw_name
+                curr_add = int(raw_start,16)
+                if current_section is not None and not change_of_data_section:
+                    # End previous section
+                    assert current_section.end_addr == curr_add
+                    objdump.sections.append(current_section)
+                change_of_data_section = False
+                # Start the new one
+                current_section = ObjDump_Section(start_addr=curr_add,name=raw_name)  # .replace('<','').replace('>','')) ?
+            else:
+                elements = line.strip().split('\t')
+                assert ':' == elements[0][-1]
+                curr_add = elements[0][:-1]
+                assert curr_add.isalnum()
+                curr_add = int(curr_add,16)
+                hex_repr = elements[1].strip()
+                if len(elements) == 2 :
+                    #nop, quick path
+                    instr = "nop"
+                    params = ""
+                else:
+                    assert len(elements) == 3
+                    textual_repr = elements[2] if len(elements) == 3 else "nop"
+                    tr_splitted = textual_repr.split()
+                    # for everything but `bnd <instr>`, instruction is one word, rest is params
+                    # `bnd` simply specifies CPU to check bounds, can ignore it, as it doesn't give semantical info abt input
+                    if "bnd" in textual_repr:
+                        assert tr_splitted[0] == "bnd"
+                        tr_splitted = tr_splitted[1:]
+                    instr = tr_splitted[0]
+                    # restore params with spaces (e.g.: for `call`)
+                    params = ' '.join(tr_splitted[1:])
+                curr_line_asm = ObjDump_ASM_Instr(curr_add,hex_repr,instr,params)
+                current_section.asm_instructions.append(curr_line_asm)
+        elif current_section is not None:
+            # End Section
+            last_asm_instr = current_section.asm_instructions[-1]
+            current_section.end_addr = last_asm_instr.addr + len(last_asm_instr.hex_repr.split())
+    objdump.sections.sort(key=lambda section: section.start_addr) # Should essentially not change the order, but juuuust in case
+    return objdump
+
+
+def get_surrounding_assembly(loe:LibOrExe,ip:int,window:int=3, only_future=False) -> (list[ObjDump_ASM_Instr],str):
+    correct_rec = Record.find_record(loe.records,ip)
+    assert correct_rec
+    ip = correct_rec.offset + (ip-correct_rec.addr_start)
+    # returns element after which we can insert such that we remain sorted
+    objdump = loe.objdump
+    address_section_idx = bisect_left(objdump.sections,ip,lo=0,hi=len(objdump.sections),key=lambda section: section.start_addr)
+    if objdump.sections[address_section_idx].start_addr != ip:
+        assert address_section_idx != 0 and objdump.sections[address_section_idx].start_addr > ip
+        address_section_idx -= 1
+    ip_sect = objdump.sections[address_section_idx]
+    assert ip_sect.start_addr <= ip < ip_sect.end_addr
+    asms_in_sect = ip_sect.asm_instructions
+    ip_idx_in_list = binary_search(asms_in_sect,ip,lambda asm_inst: asm_inst.addr)
+    assert ip_idx_in_list != -1
+    min_past,max_future = max(0,ip_idx_in_list-window),min(len(asms_in_sect),ip_idx_in_list+window)
+    if only_future:
+        min_past = ip_idx_in_list
+    return asms_in_sect[min_past:max_future],ip_sect.name
+
 
 def main():
     parser = argparse.ArgumentParser("Process input and write csv-formatted data to stdout/output file")
@@ -180,17 +294,7 @@ def main():
         print(len(df.index))
         return
 
-    # group faults by trace
-    if "pages" in df:
-        df = df.groupby([TRACECOL, FLAGSCOL])["pages"].sum().reset_index(name='count')
-    else:
-        df = df.groupby([TRACECOL, FLAGSCOL]).size().reset_index(name='count')
     df = df.rename(columns={TRACECOL: "ips"})
-    df = df.sort_values("count", ascending=False)
-    df["percent"] = (df['count'] / df['count'].sum()) * 100
-    df["percent"] = df["percent"].astype(int)
-
-    # NOTE: adding more columns after grouping traces is fine
 
     # evaluate op & type
     if df.empty:
@@ -205,7 +309,7 @@ def main():
 
     # get all unique ips
     iplists = df['ips'].str.split("|")
-    ips = set(sum(iplists, []))
+    ips = set().union(*[set(i) for i in iplists])
     ips.discard("")
 
     # if procmap is available, look up library locations
@@ -236,10 +340,27 @@ def main():
     # if binary is provided, use it to look up code locations
     codemap = {}
     if args.binary:
-        locations = lookup_code_locations(args.binary, ips)
-        codemap = dict(zip(ips, locations))
-        # print(codemap)
-    
+        assert args.procmap
+        for path,lib in libs.items():
+            # If there is an executable record (= memory region) for that lib/exec
+            if sum([int('x' in record.perms) for record in lib.records])>0:
+                lib.objdump = get_objdump_object(lib.path)
+        ip_to_windows_cache = {}
+        def instructions_lookup(ips):
+            iplist = ips.split("|")
+            if iplist[-1] == '':
+                del iplist[-1]
+            instrs = ';'.join(
+                [' '.join(
+                    [asm_instr.get_full_text_repr() for asm_instr in
+                     ip_to_windows_cache.setdefault(ip,
+                                                    get_surrounding_assembly(libs[libmap[ip]],
+                                                                             int(ip,16),
+                                                                             only_future=True))[0]]
+                    ) for ip in iplist])
+            return instrs
+        df['surr_insts'] = df['ips'].apply(instructions_lookup)
+
     # make a new code column
     def codelookup(ips):
         iplist = ips.split("|")

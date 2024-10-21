@@ -17,9 +17,11 @@
 #include "rmem/common.h"
 #include "rmem/config.h"
 #include "rmem/handler.h"
+#include "rmem/fsampler.h"
+
 
 #define FAULT_TRACE_BUF_SIZE    (FAULT_TRACE_STEPS*15)
-#define MAX_FAULT_SAMPLE_LEN    1000
+#define MAX_FAULT_SAMPLE_LEN    1000 //Decides of the size of *stack* char array
 #define FSAMPLER_MAX_BUFS       10000
 
 /* defs */
@@ -28,7 +30,10 @@ struct fsample {
     volatile int trace_in_progress;     /* backtrace in progress */
     int fsid;
     unsigned long tstamp_tsc;
-    unsigned long ip;
+    union{
+        struct pt_regs regs;
+        unsigned long ip;
+    };
     unsigned long addr;
     int flags;
     int tid;
@@ -79,11 +84,85 @@ void fault_sample_to_str(void* sample, char* sbuf, int max_len)
                 (FAULT_TRACE_BUF_SIZE - 1 - strlen(trace)),
                 "%p|", fs->bktrace[i]);
 
+    #if defined(EXTRA_REGS_KERNEL)
+    /* convert the registers to text */
+    BUG_ON((sizeof(struct pt_regs) != 168 && sizeof(struct pt_regs) != 68));
+    
+    char regs_to_string[400] = {0};
+    
+    if(sizeof(struct pt_regs) == 168){
+        //x86_64
+        unsigned short num_regs =  sizeof(struct pt_regs) / sizeof(unsigned long);
+        unsigned long* regs_as_array = (unsigned long*)(&fs->regs);
+        for(i = 0;i<num_regs && strlen(regs_to_string) < (400-1);i++){
+            snprintf(&regs_to_string[strlen(regs_to_string)], 
+            400 - 1 - strlen(regs_to_string),
+            "%lu!",regs_as_array[i]);
+        }
+    }
+    else{
+        //sizeof(struct pt_regs) == 68
+        //Data was captured on a x86 (32 bit arch) -> we must use "x86_64-emulated" registers, aka
+        struct emulated_32bit_pt_regs {
+            unsigned int bx;
+            unsigned int cx;
+            unsigned int dx;
+            unsigned int si;
+            unsigned int di;
+            unsigned int bp;
+            unsigned int ax;
+            unsigned short ds;
+            unsigned short __dsh;
+            unsigned short es;
+            unsigned short __esh;
+            unsigned short fs;
+            unsigned short __fsh;
+            //On interrupt, gs and __gsh store the vector number.  They never
+            //store gs any more.
+            unsigned short gs;
+            unsigned short __gsh;
+            // On interrupt, this is the error code. 
+            unsigned int orig_ax;
+            unsigned int ip;
+            unsigned short cs;
+            unsigned short __csh;
+            unsigned int flags;
+            unsigned int sp;
+            unsigned short ss;
+            unsigned short __ssh;
+        };
+        struct emulated_32bit_pt_regs* e_regs = (struct emulated_32bit_pt_regs*)(&fs->regs);
+
+        n = snprintf(regs_to_string, 400 - 1 , "%u!%u!%u!%u!%u!%u!%u!%hu!%hu!%hu!%hu!%hu!%hu!%hu!%hu!%u!%u!%hu!%hu!%u!%u!%hu!%hu!",
+        e_regs->bx,e_regs->cx,e_regs->dx,e_regs->si,e_regs->di,e_regs->bp,e_regs->ax,e_regs->ds,e_regs->__dsh,e_regs->es,
+        e_regs->__esh,e_regs->fs,e_regs->__fsh,e_regs->gs,e_regs->__gsh,e_regs->orig_ax,e_regs->ip,e_regs->cs,e_regs->__csh,
+        e_regs->flags,e_regs->sp,e_regs->ss,e_regs->__ssh);
+        BUG_ON(n>=400);
+    }
+    #endif
+
     /* write to string buf */
-    n = snprintf(sbuf, max_len, "%lf,%lx,%lx,%d,%d,%d,%s", 
-            sampler_start_unix_time + 
-            (fs->tstamp_tsc - sampler_start_tsc) / (1000000.0 * cycles_per_us),
-            fs->ip, fs->addr, fs->npages, fs->flags, fs->tid, trace);
+    n = snprintf(sbuf, max_len,
+            #ifndef EXTRA_REGS_KERNEL 
+            "%lf,%lx,%lx,%d,%d,%d,%s", 
+            #else
+            "%lf,%lx,%lx,%d,%d,%d,%s,%s",
+            #endif
+            sampler_start_unix_time + (fs->tstamp_tsc - sampler_start_tsc) / (1000000.0 * cycles_per_us),
+            #ifndef EXTRA_REGS_KERNEL
+            fs->ip,
+            #else
+            //You might be wondering why we use `rip`, although /usr/src/linux-hwe-6.8-headers-6.8.0-45+vgiuffd/arch/x86/include/asm/ptrace.h defines the struct pt_regs as having a `ip` field instead?
+            //welp, turns out depending on how you install your custom kernel to handle register passing in `uffd_msg`, gnu extension is not added in your source header. Therefore, it is impossible to just use your source file header includes without manually symlinking every gnu file in your source dirs
+            // (simply also adding -I<your source headers> will not work as you will redefine the structs defined in your /usr/include standard includes)
+            //However, since the only differenece between /usr/include/asm/ptrace.h and the custom kernel's ptrace.h is the name of the attributes (the size and position does not change), we can simply rename that field for the program to compile
+            fs->regs.rip, 
+            #endif
+            fs->addr, fs->npages, fs->flags, fs->tid,
+            #if defined(EXTRA_REGS_KERNEL)
+            regs_to_string,
+            #endif
+            trace);
     BUG_ON(n >= max_len);   /* truncated */
 }
 
@@ -100,7 +179,13 @@ struct sampler_ops fault_sampler_ops = {
  * @flags: the flags associated with the fault (see FSAMPLER_FAULT_FLAG_*)
  * @tid: the faulting thread id
  */
-void fsampler_add_fault_sample(int fsid, unsigned long addr, int flags, pid_t tid)
+void fsampler_add_fault_sample(int fsid, unsigned long addr, int flags, 
+#if defined(EXTRA_IP_KERNEL)
+unsigned long ip, 
+#elif defined(EXTRA_REGS_KERNEL)
+struct pt_regs regs,
+#endif
+pid_t tid)
 {
     int ret, bufid;
     struct sampler* sampler;
@@ -168,6 +253,13 @@ void fsampler_add_fault_sample(int fsid, unsigned long addr, int flags, pid_t ti
     sample->tstamp_tsc = now_tsc;
     sample->flags = flags;
     sample->addr = addr;
+    #if defined(EXTRA_IP_KERNEL)
+    sample->ip = ip;
+    #elif defined(EXTRA_REGS_KERNEL)
+    sample->regs = regs;
+    #else 
+    sample->ip = 0; // We don't have any additional information --> no way to get the ip of the faulting instruction
+    #endif
     sample->tid = tid;
     sample->trace_size = 0;
     sample->busy = 1;
@@ -245,6 +337,7 @@ int fsampler_get_sampler()
     /* atomically g et a sampler id */
     do {
         fsid = atomic_read(&nsamplers);
+        log_info("fsid=%d",fsid);
         BUG_ON(fsid > MAX_FAULT_SAMPLERS);
         if (fsid == MAX_FAULT_SAMPLERS) {
             log_warn("out of fault samplers!");
@@ -257,7 +350,11 @@ int fsampler_get_sampler()
     /* initialize base sampler */
     sprintf(fsname, "fltrace-data-faults-%d-%d.out", getpid(), 1 + fsid);
     sampler_init(&fsamplers[fsid].base, fsname,
+        #if defined(EXTRA_REGS_KERNEL)
+        /* header= */ "tstamp,ip,addr,pages,flags,tid,regs,trace",
+        #else
         /* header= */ "tstamp,ip,addr,pages,flags,tid,trace",
+        #endif
         fsamples_per_sec > 0 ? SAMPLER_TYPE_POISSON : SAMPLER_TYPE_NONE,
         &fault_sampler_ops, sizeof(struct fsample), 
         /* queue size = */ 1000, /* sampling rate = */ fsamples_per_sec,

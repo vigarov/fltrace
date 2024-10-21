@@ -76,6 +76,9 @@ CFLAGS += -fPIC # (fltrace is a shared library)
 CFLAGS += -DKEEP_PERTHREAD_DATA
 CFLAGS += -DFAULT_SAMPLER
 
+# Add extra kernel functionality
+CFLAGS += -DEXTRA_REGS_KERNEL
+
 #
 # Makefile targets
 #

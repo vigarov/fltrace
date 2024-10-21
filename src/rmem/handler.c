@@ -6,7 +6,12 @@
 #define _GNU_SOURCE
 #endif
 
+#if defined(EXTRA_REGS_KERNEL) || defined(EXTRA_IP_KERNEL)
+#include "/usr/src/CUSTOM_KERNEL_NAME/include/uapi/linux/userfaultfd.h"
+#else
 #include <linux/userfaultfd.h>
+#endif
+
 #include <unistd.h>
 
 #include "base/cpu.h"
@@ -134,8 +139,18 @@ static inline fault_t* read_uffd_fault()
         if (!(pflags & PFLAG_REGISTERED) || (pflags & PFLAG_PRESENT_ZERO_PAGED))
             flags |= FSAMPLER_FAULT_FLAG_ZERO;
 
+        #if defined(EXTRA_IP_KERNEL)
+        unsigned long ip = message.arg.pagefault.ip_fault;
+        #elif defined(EXTRA_REGS_KERNEL)
+        struct pt_regs regs_copy = message.arg.pagefault.registers_copy;
+        #endif
         /* record if sampling faults */
         fsampler_add_fault_sample(my_hthr->fsampler_id, addr, flags,
+            #if defined(EXTRA_IP_KERNEL)
+            ip,
+            #elif defined(EXTRA_REGS_KERNEL)
+            regs_copy,
+            #endif
             message.arg.pagefault.feat.ptid);
 #endif
 
@@ -161,6 +176,7 @@ static void* rmem_handler(void *arg)
     my_hthr = (hthread_t*) arg; /* save our hthread_t */
     unsigned long now_tsc, last_tsc;
 
+    log_info("Sampler thread started");
     /* init per-thread resources */
     r = thread_init_perthread(); assertz(r); /* for tcache support */
     rmem_common_init_thread(&my_hthr->bkend_chan_id, my_hthr->rstats, 0);
@@ -169,6 +185,8 @@ static void* rmem_handler(void *arg)
 #ifdef FAULT_SAMPLER
     my_hthr->fsampler_id = fsampler_get_sampler();
 #endif
+
+    log_info("Got sampler");
 
     /* do work */
     last_tsc = 0;

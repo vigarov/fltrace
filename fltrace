@@ -111,7 +111,7 @@ if [[ $COMMAND == "record" ]]; then
     if ! [[ "$LOCAL_MEM_MB" =~ $re ]] ; then usage_error "$LOCAL_MEM_MB is not a number";   fi
     if ! [[ "$MAX_MEM_MB" =~ $re ]] ; then usage_error "$MAX_MEM_MB is not a number";     fi
     totalmb=$((LOCAL_MEM_MB + MAX_MEM_MB))
-    freemb=$(free -m | awk '/^Mem:/{print $4}')
+    freemb=$(free -m | awk '/^Mem:/{print $7}')
     if [[ $totalmb -gt $freemb ]]; then usage_error "local + maxmem ($totalmb MB) exceeds available memory ($freemb MB)"; fi
     if ! [[ $@ ]]; then usage_error "missing command to run (must follow --)";   fi
     if [ ! -f ${SCRIPT_DIR}/fltrace.so ]; then usage_error "fltrace.so not found, did you 'make'?"; fi

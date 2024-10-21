@@ -5,7 +5,7 @@
 #ifndef __RDMA_H__
 #define __RDMA_H__
 
-#include <infiniband/verbs.h>
+//#include <infiniband/verbs.h>
 #include <netdb.h>
 #include <rdma/rdma_cma.h>
 #include <stdatomic.h>

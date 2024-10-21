@@ -50,6 +50,7 @@ unsigned long long get_process_vm_counter(const char* name)
         }
     }
     fclose(file);
+    if(!found) log_err("!vmcounter did not find %s counter", name);
     BUG_ON(!found);
 
     value *= 1024;  /* to bytes */
@@ -65,9 +66,13 @@ void save_process_maps()
     /* we could use system("cp") to copy the file but it creates a new 
      * process and causes issues with inherited LD_PRELOAD */
     sprintf(fname, "fltrace-data-procmaps-%d.out", getpid());
+
     source = fopen("/proc/self/maps", "r");
+    BUG_ON(!source);    
     target = fopen(fname, "w");
-    while ((ch = fgetc(source)) != EOF)
+    BUG_ON(!target);
+    
+    while ((ch = fgetc(source)) != EOF) 
         fputc(ch, target);
     fclose(source);
     fclose(target);
@@ -164,6 +169,7 @@ static void* stats_worker(void *arg)
 
         /* save latest process maps */
         save_process_maps();
+        log_info("ended saving procmaps");
     }
 
     fclose(fp);
@@ -182,6 +188,7 @@ int start_stats_thread(int pincore_id)
     /* start stats thread */
     ret = pthread_create(&stats_thread, NULL, stats_worker, NULL);
     assertz(ret);
+
 
     /* pin thread */
     if (pincore_id >= 0) {

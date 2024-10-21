@@ -279,17 +279,13 @@ def main():
 
     # op col renamd to flags
     FLAGSCOL="flags"
-    if "kind" in df:
-            FLAGSCOL="kind"
 
     # group by ip or trace
-    TRACECOL="ip"
-    if "trace" in df:
-        TRACECOL="trace"
+    TRACECOL="trace"
 
     # return max uniq addrs if specified
     if args.maxaddrs:
-        df = df[df[FLAGSCOL] < 32]  # filter out zero-page faults
+        df = df[df[FLAGSCOL] < 32]  # filter out zero-page faults : this removes all page faults which occur on the first access of page
         df = df.groupby("addr").size().reset_index(name='count')
         print(len(df.index))
         return

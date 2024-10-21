@@ -5,7 +5,7 @@
 #ifndef __REGION_H__
 #define __REGION_H__
 
-#include <infiniband/verbs.h>   /* TODO: get rid of this dependency */
+//#include <infiniband/verbs.h>   /* TODO: get rid of this dependency */
 #include <sys/queue.h>
 #include <stdatomic.h>
 
